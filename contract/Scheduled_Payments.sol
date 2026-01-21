@@ -5,26 +5,41 @@ import {
     AutomationCompatibleInterface
 } from "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
 
-/**
- * @title ScheduledPayments
- * @notice v1 scheduled ETH payments using Chainlink Automation (single upkeep)
- */
 contract ScheduledPayments is AutomationCompatibleInterface {
+    /*//////////////////////////////////////////////////////////////
+                                TYPES
+    //////////////////////////////////////////////////////////////*/
+
     struct Schedule {
         address payer;
         address recipient;
-        uint256 amount;
-        uint256 interval;
+        uint256 amount; // per execution (principal)
+        uint256 interval; // 0 = one-time
         uint256 nextExecution;
+        uint256 executionsLeft; // must be > 0
+        uint256 remainingBalance; // remaining principal
         bool active;
     }
 
+    /*//////////////////////////////////////////////////////////////
+                                STORAGE
+    //////////////////////////////////////////////////////////////*/
+
     Schedule[] public schedules;
+    mapping(address => uint256[]) private userScheduleIds;
 
     uint256 public constant MAX_EXECUTIONS_PER_UPKEEP = 10;
 
+    // protocol fee (basis points)
+    uint256 public feeBps = 50; // 0.5%
+    address public immutable feeRecipient;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
     event ScheduleCreated(uint256 indexed id, address indexed payer);
-    event ScheduleCancelled(uint256 indexed id);
+    event ScheduleCancelled(uint256 indexed id, uint256 refundedPrincipal);
     event PaymentExecuted(
         uint256 indexed id,
         address indexed recipient,
@@ -32,19 +47,50 @@ contract ScheduledPayments is AutomationCompatibleInterface {
     );
 
     /*//////////////////////////////////////////////////////////////
-                                USER ACTIONS
+                                CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
+    constructor(address _feeRecipient) {
+        require(_feeRecipient != address(0), "Invalid fee recipient");
+        feeRecipient = _feeRecipient;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            USER ACTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Create a scheduled payment (escrowed principal)
+     * @param recipient payment receiver
+     * @param amount ETH per execution
+     * @param interval seconds between executions (0 = one-time)
+     * @param startTime first execution timestamp
+     * @param executions number of executions (> 0)
+     */
     function createSchedule(
         address recipient,
         uint256 amount,
         uint256 interval,
-        uint256 startTime
-    ) external returns (uint256 id) {
+        uint256 startTime,
+        uint256 executions
+    ) external payable returns (uint256 id) {
         require(recipient != address(0), "Invalid recipient");
         require(amount > 0, "Amount must be > 0");
-        require(interval > 0, "Interval must be > 0");
+        require(executions > 0, "Executions required");
         require(startTime >= block.timestamp, "Start time in past");
+
+        if (interval == 0) {
+            require(executions == 1, "One-time must execute once");
+        }
+
+        uint256 totalPrincipal = amount * executions;
+        uint256 totalFee = (totalPrincipal * feeBps) / 10_000;
+
+        require(msg.value >= totalPrincipal + totalFee, "Too few ETH sent");
+
+        // pay protocol fee immediately (non-refundable)
+        (bool feeOk, ) = feeRecipient.call{value: totalFee}("");
+        require(feeOk, "Fee transfer failed");
 
         schedules.push(
             Schedule({
@@ -53,11 +99,15 @@ contract ScheduledPayments is AutomationCompatibleInterface {
                 amount: amount,
                 interval: interval,
                 nextExecution: startTime,
+                executionsLeft: executions,
+                remainingBalance: totalPrincipal,
                 active: true
             })
         );
 
         id = schedules.length - 1;
+        userScheduleIds[msg.sender].push(id);
+
         emit ScheduleCreated(id, msg.sender);
     }
 
@@ -67,14 +117,17 @@ contract ScheduledPayments is AutomationCompatibleInterface {
         require(s.active, "Already inactive");
 
         s.active = false;
-        emit ScheduleCancelled(id);
+
+        uint256 refund = s.remainingBalance;
+        s.remainingBalance = 0;
+
+        if (refund > 0) {
+            (bool ok, ) = s.payer.call{value: refund}("");
+            require(ok, "Refund failed");
+        }
+
+        emit ScheduleCancelled(id, refund);
     }
-
-    /*//////////////////////////////////////////////////////////////
-                                FUNDING
-    //////////////////////////////////////////////////////////////*/
-
-    receive() external payable {}
 
     /*//////////////////////////////////////////////////////////////
                         CHAINLINK AUTOMATION
@@ -86,12 +139,7 @@ contract ScheduledPayments is AutomationCompatibleInterface {
         uint256 len = schedules.length;
 
         for (uint256 i = 0; i < len; i++) {
-            Schedule storage s = schedules[i];
-            if (
-                s.active &&
-                block.timestamp >= s.nextExecution &&
-                address(this).balance >= s.amount
-            ) {
+            if (_isExecutable(schedules[i])) {
                 return (true, "");
             }
         }
@@ -110,28 +158,73 @@ contract ScheduledPayments is AutomationCompatibleInterface {
         ) {
             Schedule storage s = schedules[i];
 
-            if (
-                s.active &&
-                block.timestamp >= s.nextExecution &&
-                address(this).balance >= s.amount
-            ) {
-                // update state FIRST
-                s.nextExecution += s.interval;
-
-                (bool ok, ) = s.recipient.call{value: s.amount}("");
-                require(ok, "ETH transfer failed");
-
-                emit PaymentExecuted(i, s.recipient, s.amount);
+            if (_isExecutable(s)) {
+                _executeSchedule(i, s);
                 executed++;
             }
         }
     }
 
     /*//////////////////////////////////////////////////////////////
-                            VIEW HELPERS
+                            INTERNAL LOGIC
     //////////////////////////////////////////////////////////////*/
 
-    function schedulesCount() external view returns (uint256) {
-        return schedules.length;
+    function _isExecutable(Schedule storage s) internal view returns (bool) {
+        return (s.active &&
+            s.executionsLeft > 0 &&
+            block.timestamp >= s.nextExecution &&
+            s.remainingBalance >= s.amount);
+    }
+
+    function _executeSchedule(uint256 id, Schedule storage s) internal {
+        // effects
+        s.executionsLeft -= 1;
+        s.remainingBalance -= s.amount;
+
+        if (s.executionsLeft == 0) {
+            s.active = false;
+        } else {
+            s.nextExecution += s.interval;
+        }
+
+        // interaction
+        (bool ok, ) = s.recipient.call{value: s.amount}("");
+        require(ok, "Payment failed");
+
+        emit PaymentExecuted(id, s.recipient, s.amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            VIEW FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function getSchedule(uint256 id) external view returns (Schedule memory) {
+        return schedules[id];
+    }
+
+    function getUserScheduleIds(
+        address user
+    ) external view returns (uint256[] memory) {
+        return userScheduleIds[user];
+    }
+
+    function getUserSchedules(
+        address user
+    ) external view returns (Schedule[] memory result) {
+        uint256[] memory ids = userScheduleIds[user];
+        result = new Schedule[](ids.length);
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            result[i] = schedules[ids[i]];
+        }
+    }
+
+    function previewTotalCost(
+        uint256 amount,
+        uint256 executions
+    ) external view returns (uint256 totalCost) {
+        uint256 principal = amount * executions;
+        uint256 fee = (principal * feeBps) / 10_000;
+        return principal + fee;
     }
 }

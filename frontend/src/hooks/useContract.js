@@ -18,6 +18,10 @@ export function useContract(provider, signer, address) {
       setContract(contractInstance);
     } else {
       setContract(null);
+      // Clear data when disconnected
+      setSchedules([]);
+      setScheduleIds([]);
+      setContractBalance('0');
     }
   }, [signer, isValidContractAddress]);
 
